@@ -76,7 +76,7 @@ void setup() {
   // put your setup code here, to run once:
   Serial.begin(115200);
   // comment out the below line to cancel the wait for USB connection (needed for native USB)
-  while (!Serial)
+  while (!Serial && millis() < 5000);  // Chờ tối đa 5 giây rồi tiếp tục
     ;
   Serial.println("Edge Impulse Inferencing Demo");
 
