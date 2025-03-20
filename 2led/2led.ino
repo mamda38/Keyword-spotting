@@ -44,7 +44,7 @@
   
 
 /* Includes ---------------------------------------------------------------- */
-#include <test5_inferencing.h>
+#include <test9_inferencing.h>
 
 #include <I2S.h>
 #define SAMPLE_RATE 16000U
@@ -64,7 +64,7 @@ typedef struct {
 } inference_t;
 
 static inference_t inference;
-static const uint32_t sample_buffer_size = 2048; // thay đổi để tăng thời gian nhận dữ liệu âm thanh t= sample_buffer_size / 16kHz
+static const uint32_t sample_buffer_size = 6144; // thay đổi để tăng thời gian nhận dữ liệu âm thanh t= sample_buffer_size / 16kHz
 static signed short sampleBuffer[sample_buffer_size];
 static bool debug_nn = false;  // Set this to true to see e.g. features generated from the raw signal
 static bool record_status = true;
@@ -157,37 +157,33 @@ void loop() {
 
   }
       // Display inference result
-    if (pred_index == 4) {
-      if (pred_value > 0.80) {
-        digitalWrite(LED_1, HIGH);  //Turn on
-        Serial.println("LED1 ON");
-      }
-    }
-    if (pred_index == 1) {
-      if (pred_value > 0.80) {
-        digitalWrite(LED_1, LOW);  //Turn off
-        Serial.println("LED1 OFF");
-      }
-    }
-    if (pred_index == 2) {
-      if (pred_value > 0.80) {
-        digitalWrite(LED_2, HIGH);  //Turn on
-        Serial.println("LED2 ON");
-      }
-    }
-    if (pred_index == 3) {
-      if (pred_value > 0.80) {
-        digitalWrite(LED_2, LOW);  //Turn off
-        Serial.println("LED2 OFF");
-      }
-    }
-
+if (pred_value > 0.77) {  // Chỉ xử lý nếu độ chính xác cao
+  switch (pred_index) {
+    case 0:
+      digitalWrite(LED_1, HIGH);  
+      Serial.println("LED1 ON");
+      break;
+    case 3:
+      digitalWrite(LED_1, LOW);   
+      Serial.println("LED1 OFF");
+      break;
+    case 1:
+      digitalWrite(LED_2, HIGH);  
+      Serial.println("LED2 ON");
+      break;
+    case 4:
+      digitalWrite(LED_2, LOW);   
+      Serial.println("LED2 OFF");
+      break;
+  }
+}
 
 #if EI_CLASSIFIER_HAS_ANOMALY == 1
   ei_printf("    anomaly score: ");
   ei_printf_float(result.anomaly);
   ei_printf("\n");
 #endif
+
 }
 
 static void audio_inference_callback(uint32_t n_bytes) {
