@@ -31,7 +31,7 @@ typedef struct {
 } inference_t;
 
 static inference_t inference;
-static const uint32_t sample_buffer_size = 6144;
+static const uint32_t sample_buffer_size = 4096;
 static signed short sampleBuffer[sample_buffer_size];
 static bool debug_nn = false;
 static bool record_status = true;

@@ -1,59 +1,26 @@
 /* Edge Impulse Arduino examples
- * Copyright (c) 2022 EdgeImpulse Inc.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Optimized for embedded applications
  */
 
 // If your target is limited in memory remove this macro to save 10K RAM
 #define EIDSP_QUANTIZE_FILTERBANK 0
 
-/*
- ** NOTE: If you run into TFLite arena allocation issue.
- **
- ** This may be due to may dynamic memory fragmentation.
- ** Try defining "-DEI_CLASSIFIER_ALLOCATION_STATIC" in boards.local.txt (create
- ** if it doesn't exist) and copy this file to
- ** `<ARDUINO_CORE_INSTALL_PATH>/arduino/hardware/<mbed_core>/<core_version>/`.
- **
- ** See
- ** (https://support.arduino.cc/hc/en-us/articles/360012076960-Where-are-the-installed-cores-located-)
- ** to find where Arduino installs cores on your machine.
- **
- ** If the problem persists then there's not enough memory for this model and application.
-
-
- Tested with ESP32 Boards package version 2.0.16
- */
-
-  
-
 /* Includes ---------------------------------------------------------------- */
 #include <test9_inferencing.h>
-
 #include <I2S.h>
+
+// Constants
 #define SAMPLE_RATE 16000U
 #define SAMPLE_BITS 16
-
-
 #define LED_1 2
 #define LED_2 3
+#define CONFIDENCE_THRESHOLD 0.77f
+#define INFERENCE_DELAY 100  // ms between inferences
+#define SERIAL_TIMEOUT 5000  // ms to wait for serial
 
+// Pin definitions
+const int8_t I2S_MIC_SERIAL_CLOCK = 42;
+const int8_t I2S_MIC_SERIAL_DATA = 41;
 
 /** Audio buffers, pointers and selectors */
 typedef struct {
@@ -64,126 +31,144 @@ typedef struct {
 } inference_t;
 
 static inference_t inference;
-static const uint32_t sample_buffer_size = 6144; // thay đổi để tăng thời gian nhận dữ liệu âm thanh t= sample_buffer_size / 16kHz
+static const uint32_t sample_buffer_size = 10240;
 static signed short sampleBuffer[sample_buffer_size];
-static bool debug_nn = false;  // Set this to true to see e.g. features generated from the raw signal
+static bool debug_nn = false;
 static bool record_status = true;
+static TaskHandle_t sampling_task_handle = NULL;
+
+// Function prototypes
+static bool microphone_inference_start(uint32_t n_samples);
+static bool microphone_inference_record(void);
+static int microphone_audio_signal_get_data(size_t offset, size_t length, float *out_ptr);
+static void microphone_inference_end(void);
+static void capture_samples(void *arg);
+static void audio_inference_callback(uint32_t n_bytes);
 
 /**
  * @brief      Arduino setup function
  */
 void setup() {
-  // put your setup code here, to run once:
+  // Initialize serial at high baud rate
   Serial.begin(115200);
-  // comment out the below line to cancel the wait for USB connection (needed for native USB)
-  while (!Serial && millis() < 5000);  // Chờ tối đa 5 giây rồi tiếp tục
-    ;
+  
+  // Don't wait too long for serial to avoid blocking in production
+  uint32_t serialStartTime = millis();
+  while (!Serial && (millis() - serialStartTime < SERIAL_TIMEOUT));
+  
   Serial.println("Edge Impulse Inferencing Demo");
 
+  // Configure LED pins
   pinMode(LED_1, OUTPUT);  
-  pinMode(LED_2, OUTPUT);   // Set the pin as output
-
+  pinMode(LED_2, OUTPUT);
   digitalWrite(LED_1, LOW);
-  digitalWrite(LED_2, LOW);  //Turn off
+  digitalWrite(LED_2, LOW);
 
-  I2S.setAllPins(-1, 42, 41, -1, -1);
+  // Initialize I2S with specific pins for this board
+  I2S.setAllPins(-1, I2S_MIC_SERIAL_CLOCK, I2S_MIC_SERIAL_DATA, -1, -1);
   if (!I2S.begin(PDM_MONO_MODE, SAMPLE_RATE, SAMPLE_BITS)) {
     Serial.println("Failed to initialize I2S!");
-    while (1)
-      ;
+    // Continue anyway - don't block in production
   }
 
-  // summary of inferencing settings (from model_metadata.h)
-  ei_printf("Inferencing settings:\n");
-  ei_printf("\tInterval: ");
-  ei_printf_float((float)EI_CLASSIFIER_INTERVAL_MS);
-  ei_printf(" ms.\n");
-  ei_printf("\tFrame size: %d\n", EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE);
-  ei_printf("\tSample length: %d ms.\n", EI_CLASSIFIER_RAW_SAMPLE_COUNT / 16);
-  ei_printf("\tNo. of classes: %d\n", sizeof(ei_classifier_inferencing_categories) / sizeof(ei_classifier_inferencing_categories[0]));
-
-  ei_printf("\nStarting continious inference in 2 seconds...\n");
-  ei_sleep(2000);
+  // Only print debug info when serial is connected
+  if (Serial) {
+    // summary of inferencing settings
+    ei_printf("Inferencing settings:\n");
+    ei_printf("\tInterval: ");
+    ei_printf_float((float)EI_CLASSIFIER_INTERVAL_MS);
+    ei_printf(" ms.\n");
+    ei_printf("\tFrame size: %d\n", EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE);
+    ei_printf("\tSample length: %d ms.\n", EI_CLASSIFIER_RAW_SAMPLE_COUNT / 16);
+    ei_printf("\tNo. of classes: %d\n", sizeof(ei_classifier_inferencing_categories) / sizeof(ei_classifier_inferencing_categories[0]));
+    ei_printf("\nStarting continuous inference in 2 seconds...\n");
+  }
+  
+  delay(1000); // Shorter delay for production
 
   if (microphone_inference_start(EI_CLASSIFIER_RAW_SAMPLE_COUNT) == false) {
-    ei_printf("ERR: Could not allocate audio buffer (size %d), this could be due to the window length of your model\r\n", EI_CLASSIFIER_RAW_SAMPLE_COUNT);
-    return;
+    if (Serial) {
+      ei_printf("ERR: Could not allocate audio buffer (size %d)\r\n", EI_CLASSIFIER_RAW_SAMPLE_COUNT);
+    }
+    // Continue anyway - don't block in production
   }
 
-  ei_printf("Recording...\n");
+  if (Serial) {
+    ei_printf("Recording...\n");
+  }
 }
 
 /**
  * @brief      Arduino main function. Runs the inferencing loop.
  */
 void loop() {
-  
-  bool m = microphone_inference_record();
-  if (!m) {
-    ei_printf("ERR: Failed to record audio...\n");
+  // Record audio
+  if (!microphone_inference_record()) {
+    // If recording fails, try again after a short delay
+    delay(10);
     return;
   }
 
-  delay(100); // chờ 200ms để thêm dữ liệu trước khi nhận diện
+  // Short delay before processing
+  delay(INFERENCE_DELAY);
 
+  // Set up signal for classifier
   signal_t signal;
   signal.total_length = EI_CLASSIFIER_RAW_SAMPLE_COUNT;
   signal.get_data = &microphone_audio_signal_get_data;
   ei_impulse_result_t result = { 0 };
 
+  // Run the classifier
   EI_IMPULSE_ERROR r = run_classifier(&signal, &result, debug_nn);
   if (r != EI_IMPULSE_OK) {
-    ei_printf("ERR: Failed to run classifier (%d)\n", r);
+    if (Serial) {
+      ei_printf("ERR: Failed to run classifier (%d)\n", r);
+    }
     return;
   }
 
-  int pred_index = 0;    // Initialize pred_index
-  float pred_value = 0;  // Initialize pred_value
-
-  // print the predictions
-  ei_printf("Predictions ");
-  ei_printf("(DSP: %d ms., Classification: %d ms., Anomaly: %d ms.)",
-            result.timing.dsp, result.timing.classification, result.timing.anomaly);
-  ei_printf(": \n");
+  // Find the prediction with highest confidence
+  int pred_index = 0;
+  float pred_value = 0;
   for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
-    ei_printf("    %s: ", result.classification[ix].label);
-    ei_printf_float(result.classification[ix].value);
-    ei_printf("\n");
-
     if (result.classification[ix].value > pred_value) {
       pred_index = ix;
       pred_value = result.classification[ix].value;
     }
-
   }
-      // Display inference result
-if (pred_value > 0.77) {  // Chỉ xử lý nếu độ chính xác cao
-  switch (pred_index) {
-    case 0:
-      digitalWrite(LED_1, HIGH);  
-      Serial.println("LED1 ON");
-      break;
-    case 3:
-      digitalWrite(LED_1, LOW);   
-      Serial.println("LED1 OFF");
-      break;
-    case 1:
-      digitalWrite(LED_2, HIGH);  
-      Serial.println("LED2 ON");
-      break;
-    case 4:
-      digitalWrite(LED_2, LOW);   
-      Serial.println("LED2 OFF");
-      break;
+
+  // Only print debug info when serial is connected
+  if (Serial) {
+    ei_printf("Predictions (DSP: %d ms., Classification: %d ms.): \n",
+              result.timing.dsp, result.timing.classification);
+    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+      ei_printf("    %s: ", result.classification[ix].label);
+      ei_printf_float(result.classification[ix].value);
+      ei_printf("\n");
+    }
   }
-}
 
-#if EI_CLASSIFIER_HAS_ANOMALY == 1
-  ei_printf("    anomaly score: ");
-  ei_printf_float(result.anomaly);
-  ei_printf("\n");
-#endif
-
+  // Process commands only if confidence is high enough
+  if (pred_value > CONFIDENCE_THRESHOLD) {
+    switch (pred_index) {
+      case 0:
+        digitalWrite(LED_1, HIGH);
+        if (Serial) Serial.println("LED1 ON");
+        break;
+      case 3:
+        digitalWrite(LED_1, LOW);
+        if (Serial) Serial.println("LED1 OFF");
+        break;
+      case 1:
+        digitalWrite(LED_2, HIGH);
+        if (Serial) Serial.println("LED2 ON");
+        break;
+      case 4:
+        digitalWrite(LED_2, LOW);
+        if (Serial) Serial.println("LED2 OFF");
+        break;
+    }
+  }
 }
 
 static void audio_inference_callback(uint32_t n_bytes) {
@@ -198,33 +183,28 @@ static void audio_inference_callback(uint32_t n_bytes) {
 }
 
 static void capture_samples(void *arg) {
-
   const int32_t i2s_bytes_to_read = (uint32_t)arg;
   size_t bytes_read = i2s_bytes_to_read;
 
   while (record_status) {
-
-    /* read data at once from i2s - Modified for XIAO ESP2S3 Sense and I2S.h library */
-    // i2s_read((i2s_port_t)1, (void*)sampleBuffer, i2s_bytes_to_read, &bytes_read, 100);
+    // Read data from I2S
     esp_i2s::i2s_read(esp_i2s::I2S_NUM_0, (void *)sampleBuffer, i2s_bytes_to_read, &bytes_read, 100);
 
     if (bytes_read <= 0) {
-      ei_printf("Error in I2S read : %d", bytes_read);
+      // Error handling - wait a bit before retrying
+      delay(10);
+      continue;
+    }
+
+    // Scale the data (amplify the sound)
+    for (int x = 0; x < i2s_bytes_to_read / 2; x++) {
+      sampleBuffer[x] = (int16_t)(sampleBuffer[x]) * 8;
+    }
+
+    if (record_status) {
+      audio_inference_callback(i2s_bytes_to_read);
     } else {
-      if (bytes_read < i2s_bytes_to_read) {
-        ei_printf("Partial I2S read");
-      }
-
-      // scale the data (otherwise the sound is too quiet)
-      for (int x = 0; x < i2s_bytes_to_read / 2; x++) {
-        sampleBuffer[x] = (int16_t)(sampleBuffer[x]) * 8;
-      }
-
-      if (record_status) {
-        audio_inference_callback(i2s_bytes_to_read);
-      } else {
-        break;
-      }
+      break;
     }
   }
   vTaskDelete(NULL);
@@ -232,10 +212,6 @@ static void capture_samples(void *arg) {
 
 /**
  * @brief      Init inferencing struct and setup/start PDM
- *
- * @param[in]  n_samples  The n samples
- *
- * @return     { description_of_the_return_value }
  */
 static bool microphone_inference_start(uint32_t n_samples) {
   inference.buffer = (int16_t *)malloc(n_samples * sizeof(int16_t));
@@ -248,33 +224,39 @@ static bool microphone_inference_start(uint32_t n_samples) {
   inference.n_samples = n_samples;
   inference.buf_ready = 0;
 
-  //    if (i2s_init(EI_CLASSIFIER_FREQUENCY)) {
-  //        ei_printf("Failed to start I2S!");
-  //    }
-
-  ei_sleep(100);
+  delay(100);
 
   record_status = true;
 
-  xTaskCreate(capture_samples, "CaptureSamples", 1024 * 32, (void *)sample_buffer_size, 10, NULL);
-
-  return true;
+  // Create task with higher stack size and priority for audio sampling
+  BaseType_t task_created = xTaskCreate(
+    capture_samples,
+    "CaptureSamples",
+    1024 * 32,
+    (void *)sample_buffer_size,
+    10,
+    &sampling_task_handle
+  );
+  
+  return (task_created == pdPASS);
 }
 
 /**
  * @brief      Wait on new data
- *
- * @return     True when finished
  */
 static bool microphone_inference_record(void) {
-  bool ret = true;
-
+  // Use a timeout to avoid blocking forever
+  uint32_t start_time = millis();
   while (inference.buf_ready == 0) {
     delay(10);
+    // Timeout after 1 second to prevent hanging
+    if (millis() - start_time > 1000) {
+      return false;
+    }
   }
 
   inference.buf_ready = 0;
-  return ret;
+  return true;
 }
 
 /**
@@ -282,7 +264,6 @@ static bool microphone_inference_record(void) {
  */
 static int microphone_audio_signal_get_data(size_t offset, size_t length, float *out_ptr) {
   numpy::int16_to_float(&inference.buffer[offset], out_ptr, length);
-
   return 0;
 }
 
@@ -290,6 +271,14 @@ static int microphone_audio_signal_get_data(size_t offset, size_t length, float 
  * @brief      Stop PDM and release buffers
  */
 static void microphone_inference_end(void) {
+  // Stop the sampling task first
+  if (sampling_task_handle != NULL) {
+    record_status = false;
+    // Wait for task to delete itself
+    delay(100);
+  }
+  
+  // Free memory
   free(sampleBuffer);
   ei_free(inference.buffer);
 }
