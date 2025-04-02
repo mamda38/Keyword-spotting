@@ -6,17 +6,23 @@
 #define EIDSP_QUANTIZE_FILTERBANK 0
 
 /* Includes ---------------------------------------------------------------- */
-#include <test9_inferencing.h>
+#include <model_11.h>
 #include <I2S.h>
 
 // Constants
 #define SAMPLE_RATE 16000U
 #define SAMPLE_BITS 16
-#define LED_1 2
-#define LED_2 3
-#define CONFIDENCE_THRESHOLD 0.77f
+#define LED_1 9
+#define LED_2 8
+#define LED_3 5
+#define CONFIDENCE_THRESHOLD 0.35f
 #define INFERENCE_DELAY 100  // ms between inferences
 #define SERIAL_TIMEOUT 5000  // ms to wait for serial
+
+// Button activation configuration
+#define ACTIVATION_BUTTON 6  // Change to your actual button pin
+#define RECORD_DURATION 610 // Time to record after button press (ms)
+#define DEBOUNCE_TIME 10     // Button debounce time in ms
 
 // Pin definitions
 const int8_t I2S_MIC_SERIAL_CLOCK = 42;
@@ -31,11 +37,17 @@ typedef struct {
 } inference_t;
 
 static inference_t inference;
-static const uint32_t sample_buffer_size = 10240;
+static const uint32_t sample_buffer_size = 4096;
 static signed short sampleBuffer[sample_buffer_size];
 static bool debug_nn = false;
 static bool record_status = true;
 static TaskHandle_t sampling_task_handle = NULL;
+
+// Button activation variables
+static bool recording_active = false;
+static unsigned long recording_start_time = 0;
+static unsigned long last_button_press = 0;
+static bool button_pressed = false;
 
 // Function prototypes
 static bool microphone_inference_start(uint32_t n_samples);
@@ -61,8 +73,13 @@ void setup() {
   // Configure LED pins
   pinMode(LED_1, OUTPUT);  
   pinMode(LED_2, OUTPUT);
+  pinMode(LED_3, OUTPUT);  
   digitalWrite(LED_1, LOW);
   digitalWrite(LED_2, LOW);
+  digitalWrite(LED_3, LOW);
+  
+  // Configure activation button with pull-up resistor
+  pinMode(ACTIVATION_BUTTON, INPUT_PULLUP);
 
   // Initialize I2S with specific pins for this board
   I2S.setAllPins(-1, I2S_MIC_SERIAL_CLOCK, I2S_MIC_SERIAL_DATA, -1, -1);
@@ -81,20 +98,15 @@ void setup() {
     ei_printf("\tFrame size: %d\n", EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE);
     ei_printf("\tSample length: %d ms.\n", EI_CLASSIFIER_RAW_SAMPLE_COUNT / 16);
     ei_printf("\tNo. of classes: %d\n", sizeof(ei_classifier_inferencing_categories) / sizeof(ei_classifier_inferencing_categories[0]));
-    ei_printf("\nStarting continuous inference in 2 seconds...\n");
+    ei_printf("\tButton-activated mode enabled\n");
+    ei_printf("\nWaiting for button press to start...\n");
   }
   
-  delay(1000); // Shorter delay for production
-
   if (microphone_inference_start(EI_CLASSIFIER_RAW_SAMPLE_COUNT) == false) {
     if (Serial) {
       ei_printf("ERR: Could not allocate audio buffer (size %d)\r\n", EI_CLASSIFIER_RAW_SAMPLE_COUNT);
     }
     // Continue anyway - don't block in production
-  }
-
-  if (Serial) {
-    ei_printf("Recording...\n");
   }
 }
 
@@ -102,82 +114,123 @@ void setup() {
  * @brief      Arduino main function. Runs the inferencing loop.
  */
 void loop() {
-  // Record audio
-  if (!microphone_inference_record()) {
-    // If recording fails, try again after a short delay
-    delay(10);
-    return;
-  }
-
-  // Short delay before processing
-  delay(INFERENCE_DELAY);
-
-  // Set up signal for classifier
-  signal_t signal;
-  signal.total_length = EI_CLASSIFIER_RAW_SAMPLE_COUNT;
-  signal.get_data = &microphone_audio_signal_get_data;
-  ei_impulse_result_t result = { 0 };
-
-  // Run the classifier
-  EI_IMPULSE_ERROR r = run_classifier(&signal, &result, debug_nn);
-  if (r != EI_IMPULSE_OK) {
-    if (Serial) {
-      ei_printf("ERR: Failed to run classifier (%d)\n", r);
+  // Check if button is pressed (with debounce)
+  bool current_button_state = digitalRead(ACTIVATION_BUTTON) == LOW;
+  
+  if (current_button_state && !button_pressed && (millis() - last_button_press > DEBOUNCE_TIME)) {
+    button_pressed = true;
+    last_button_press = millis();
+    
+    // Start recording session
+    if (!recording_active) {
+      recording_active = true;
+      recording_start_time = millis();
+      
+      // Visual feedback - turn on LED while recording
+      digitalWrite(LED_3, HIGH);
+      
+      // Reset buffer counter for new recording session
+      inference.buf_count = 0;
+      inference.buf_ready = 0;
+      
+      if (Serial) {
+        ei_printf("Recording started...\n");
+      }
     }
-    return;
+  } 
+  else if (!current_button_state && button_pressed) {
+    button_pressed = false;
   }
+  
+  // Check if we're in recording mode
+  if (recording_active) {
+    // Check if recording time elapsed or buffer is ready
+    if ((millis() - recording_start_time > RECORD_DURATION) || inference.buf_ready) {
+      recording_active = false;
+      digitalWrite(LED_3, LOW); // Turn off recording indicator
+      
+      if (Serial) {
+        ei_printf("Processing command...\n");
+      }
+      
+      // Set up signal for classifier
+      signal_t signal;
+      signal.total_length = EI_CLASSIFIER_RAW_SAMPLE_COUNT;
+      signal.get_data = &microphone_audio_signal_get_data;
+      ei_impulse_result_t result = { 0 };
 
-  // Find the prediction with highest confidence
-  int pred_index = 0;
-  float pred_value = 0;
-  for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
-    if (result.classification[ix].value > pred_value) {
-      pred_index = ix;
-      pred_value = result.classification[ix].value;
+      // Run the classifier
+      EI_IMPULSE_ERROR r = run_classifier(&signal, &result, debug_nn);
+      if (r != EI_IMPULSE_OK) {
+        if (Serial) {
+          ei_printf("ERR: Failed to run classifier (%d)\n", r);
+        }
+        return;
+      }
+
+      // Find the prediction with highest confidence
+      int pred_index = 0;
+      float pred_value = 0;
+      for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+        if (result.classification[ix].value > pred_value) {
+          pred_index = ix;
+          pred_value = result.classification[ix].value;
+        }
+      }
+
+      // Only print debug info when serial is connected
+      if (Serial) {
+        ei_printf("Predictions (DSP: %d ms., Classification: %d ms.): \n",
+                 result.timing.dsp, result.timing.classification);
+        for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+          ei_printf("    %s: ", result.classification[ix].label);
+          ei_printf_float(result.classification[ix].value);
+          ei_printf("\n");
+        }
+      }
+
+      // Process commands only if confidence is high enough
+      if (pred_value > CONFIDENCE_THRESHOLD) {
+        switch (pred_index) {
+          case 0:
+            digitalWrite(LED_1, HIGH);
+            if (Serial) Serial.println("LED1 ON");
+            break;
+          case 3:
+            digitalWrite(LED_1, LOW);
+            if (Serial) Serial.println("LED1 OFF");
+            break;
+          case 1:
+            digitalWrite(LED_2, HIGH);
+            if (Serial) Serial.println("LED2 ON");
+            break;
+          case 4:
+            digitalWrite(LED_2, LOW);
+            if (Serial) Serial.println("LED2 OFF");
+            break;
+        }
+      }
+    }
+    else if (!inference.buf_ready) {
+      // Continue recording until buffer is ready or time elapses
+      microphone_inference_record();
     }
   }
-
-  // Only print debug info when serial is connected
-  if (Serial) {
-    ei_printf("Predictions (DSP: %d ms., Classification: %d ms.): \n",
-              result.timing.dsp, result.timing.classification);
-    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
-      ei_printf("    %s: ", result.classification[ix].label);
-      ei_printf_float(result.classification[ix].value);
-      ei_printf("\n");
-    }
-  }
-
-  // Process commands only if confidence is high enough
-  if (pred_value > CONFIDENCE_THRESHOLD) {
-    switch (pred_index) {
-      case 0:
-        digitalWrite(LED_1, HIGH);
-        if (Serial) Serial.println("LED1 ON");
-        break;
-      case 3:
-        digitalWrite(LED_1, LOW);
-        if (Serial) Serial.println("LED1 OFF");
-        break;
-      case 1:
-        digitalWrite(LED_2, HIGH);
-        if (Serial) Serial.println("LED2 ON");
-        break;
-      case 4:
-        digitalWrite(LED_2, LOW);
-        if (Serial) Serial.println("LED2 OFF");
-        break;
-    }
-  }
+  
+  // Short delay to avoid hogging CPU
+  delay(10);
 }
 
 static void audio_inference_callback(uint32_t n_bytes) {
-  for (int i = 0; i < n_bytes >> 1; i++) {
-    inference.buffer[inference.buf_count++] = sampleBuffer[i];
-
-    if (inference.buf_count >= inference.n_samples) {
-      inference.buf_count = 0;
-      inference.buf_ready = 1;
+  // Only add samples to buffer if we're in recording mode
+  if (recording_active) {
+    for (int i = 0; i < n_bytes >> 1; i++) {
+      inference.buffer[inference.buf_count++] = sampleBuffer[i];
+      
+      if (inference.buf_count >= inference.n_samples) {
+        inference.buf_count = inference.n_samples;  // Ensure we don't exceed buffer
+        inference.buf_ready = 1;
+      }
     }
   }
 }
